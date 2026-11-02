@@ -1,55 +1,37 @@
 /**
- * ============================================================
- *  CẤU HÌNH ỨNG DỤNG – chỉnh sửa tại đây cho phù hợp hệ thống
- * ============================================================
+ * CẤU HÌNH – phần lớn lấy từ biến môi trường (.env). Danh sách trường ở dưới có thể sửa trực tiếp.
  */
+const env = process.env;
+const list = (v, d) => (v ? String(v).split(',').map(s => s.trim()).filter(Boolean) : d);
+const bool = (v, d) => (v === undefined || v === '' ? d : /^(1|true|yes)$/i.test(v));
+
 const CONFIG = {
-  APP_NAME: 'Cổng hồ sơ nhân sự',
-  ORG_NAME: 'KDI Education',
-
-  // Để trống nếu script được tạo từ chính file Google Sheet (Tiện ích mở rộng > Apps Script).
-  // Nếu dùng script độc lập thì dán ID file Google Sheet vào đây.
-  SPREADSHEET_ID: '',
-
-  // Tên các sheet dữ liệu có sẵn
-  SHEET_NV: 'ThongTinNhanVien',
-  SHEET_CN: 'ThongTinCaNhan',
-
-  // Các sheet do web app tự tạo khi chạy setup()
-  SHEET_HOSO: 'WA_HoSo',          // bản nháp / hồ sơ chờ duyệt
-  SHEET_YC: 'WA_YeuCauSua',       // yêu cầu chỉnh sửa của nhân viên
-  SHEET_QUYEN: 'WA_PhanQuyen',    // danh sách tài khoản nhân sự
-  SHEET_LOG: 'WA_NhatKy',         // nhật ký thao tác
-
-  // Thư mục Google Drive lưu file nhân viên tải lên.
-  // Để trống: setup() sẽ tự tạo thư mục "HoSoNhanVien_WebApp".
-  UPLOAD_FOLDER_ID: '',
-
-  // Cách ghi giá trị cột file/ảnh vào ThongTinCaNhan:
-  //  - ''  : ghi đường link Google Drive (đơn giản nhất)
-  //  - 'ThongTinCaNhan_Files_/' : ghi đường dẫn tương đối kiểu AppSheet.
-  //    Khi dùng chế độ này, UPLOAD_FOLDER_ID phải là thư mục tương ứng trong thư mục app AppSheet.
-  APPSHEET_PATH_PREFIX: '',
-
-  // Đăng nhập
+  APP_NAME: env.APP_NAME || 'Cổng hồ sơ nhân sự',
+  ORG_NAME: env.ORG_NAME || 'KDI Education',
+  APP_URL: env.APP_URL || '',
+  SPREADSHEET_ID: env.SPREADSHEET_ID || '',
+  SHEET_NV: env.SHEET_NV || 'ThongTinNhanVien',
+  SHEET_CN: env.SHEET_CN || 'ThongTinCaNhan',
+  SHEET_HOSO: 'WA_HoSo',
+  SHEET_YC: 'WA_YeuCauSua',
+  SHEET_QUYEN: 'WA_PhanQuyen',
+  SHEET_LOG: 'WA_NhatKy',
+  UPLOAD_FOLDER_ID: env.UPLOAD_FOLDER_ID || '',
+  APPSHEET_PATH_PREFIX: env.APPSHEET_PATH_PREFIX || '',
   OTP_TTL_MIN: 10,
   OTP_MAX_TRIES: 5,
   OTP_RESEND_SECONDS: 60,
-  SESSION_HOURS: 6,               // tối đa 6 giờ (giới hạn CacheService)
-  // Nhân viên có TrangThaiLamViec thuộc danh sách này sẽ không đăng nhập được
-  BLOCKED_WORK_STATUS: ['Nghỉ việc', 'Đã nghỉ việc', 'Đã nghỉ', 'Ngừng làm việc'],
-
-  // Khi nhân sự duyệt: giá trị ghi vào cột TrangThai của ThongTinCaNhan (null = không ghi)
-  CN_STATUS_ON_APPROVE: 'Đã duyệt',
-  WRITE_TUOI: true,               // tự tính và ghi cột Tuoi (bỏ qua nếu ô đang là công thức)
-  SYNC_PHONE_TO_NV: true,         // cập nhật SoDienThoai sang ThongTinNhanVien khi duyệt
-
-  // Phân quyền nhân sự theo cột này (cột PhamVi trong WA_PhanQuyen)
-  SCOPE_COLUMN: 'DonVi/ChiNhanh',
-
-  MAX_FILE_MB: 10,
-  NOTIFY_HR_ON_SUBMIT: true,
+  SESSION_HOURS: Number(env.SESSION_HOURS || 12),
+  SESSION_SECRET: env.SESSION_SECRET || '',
+  BLOCKED_WORK_STATUS: list(env.BLOCKED_WORK_STATUS, ['Nghỉ việc', 'Đã nghỉ việc', 'Đã nghỉ', 'Ngừng làm việc']),
+  CN_STATUS_ON_APPROVE: env.CN_STATUS_ON_APPROVE === undefined ? 'Đã duyệt' : (env.CN_STATUS_ON_APPROVE || null),
+  WRITE_TUOI: bool(env.WRITE_TUOI, true),
+  SYNC_PHONE_TO_NV: bool(env.SYNC_PHONE_TO_NV, true),
+  SCOPE_COLUMN: env.SCOPE_COLUMN || 'DonVi/ChiNhanh',
+  MAX_FILE_MB: Number(env.MAX_FILE_MB || 10),
+  NOTIFY_HR_ON_SUBMIT: bool(env.NOTIFY_HR_ON_SUBMIT, true),
   TIMEZONE: 'Asia/Ho_Chi_Minh',
+  CACHE_SECONDS: Number(env.CACHE_SECONDS || 15),
 };
 
 /** Trạng thái hồ sơ */
@@ -170,3 +152,10 @@ const WA_HEADERS = {
   QUYEN: ['Email', 'HoTen', 'VaiTro', 'PhamVi', 'NhanThongBao', 'KichHoat'],
   LOG: ['ThoiGian', 'MaNhanVien', 'HanhDong', 'NguoiThucHien', 'ChiTiet'],
 };
+
+/** Các cột kiểu ngày tháng (để chuyển số serial của Google Sheets sang Date) */
+const DATE_COLS = new Set(FIELDS.filter(f => f.type === 'date').map(f => f.key)
+  .concat(NV_FIELDS.filter(f => f.type === 'date').map(f => f.key))
+  .concat(['NgayVaoLamDauTien', 'NgayBatDauFulltime', 'NgayDungLamViec', 'NgayDauTienCuaNam', 'NgayTao', 'NgayCapNhat', 'NgayNop', 'NgayDuyet', 'NgayXuLy', 'ThoiGian']));
+
+module.exports = { CONFIG, ST, EDITABLE_ST, SECTIONS, FIELDS, NV_FIELDS, WA_HEADERS, DATE_COLS };

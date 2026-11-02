@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: hosotrogiang
+    runtime: node
+    plan: starter
+    buildCommand: npm ci --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: TZ
+        value: Asia/Ho_Chi_Minh
+      - key: SPREADSHEET_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: UPLOAD_FOLDER_ID
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: APP_URL
+        sync: false

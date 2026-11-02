@@ -1,4 +1,3 @@
-<style>
 :root{
   --pri:#0f4c81; --pri-2:#1565a8; --pri-soft:#e8f0f9;
   --ink:#1b2430; --muted:#667085; --line:#e4e8ee; --bg:#f4f6f9; --card:#fff;
@@ -152,4 +151,3 @@ button{font-family:inherit}
 .toast.ok{background:var(--ok)}
 .toast.err{background:var(--err)}
 @keyframes tin{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
-</style>

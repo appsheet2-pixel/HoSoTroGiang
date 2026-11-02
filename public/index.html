@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cổng hồ sơ nhân sự</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">HS</span><span id="appTitle">Cổng hồ sơ nhân sự</span></div>
+    <div id="userBox" class="userbox hidden"></div>
+  </header>
+
+  <main id="app" class="container">
+    <div class="loading-page"><div class="spinner"></div><p>Đang tải…</p></div>
+  </main>
+
+  <!-- Modal dùng chung -->
+  <div id="modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-head"><h3 id="modalTitle"></h3><button class="icon-btn" id="modalClose" aria-label="Đóng">✕</button></div>
+      <div id="modalBody" class="modal-body"></div>
+      <div id="modalFoot" class="modal-foot"></div>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    function show(html) { var a = document.getElementById('app'); if (a && !window.__appStarted) a.innerHTML = '<div class="card"><div class="alert err">' + html + '</div><button class="btn" onclick="location.reload()">Tải lại trang</button></div>'; }
+    window.addEventListener('error', function (e) { show('<b>Lỗi tải ứng dụng:</b><br>' + String(e.message || 'không rõ').replace(/</g, '&lt;') + ' (dòng ' + (e.lineno || '?') + ')'); });
+    setTimeout(function () { show('<b>Ứng dụng chưa khởi động được sau 15 giây.</b><br>Vui lòng kiểm tra mạng và tải lại trang.'); }, 15000);
+  })();
+  </script>
+  <div id="busy" class="busy hidden"><div class="spinner"></div><span id="busyText">Đang xử lý…</span></div>
+  <div id="toasts" class="toasts"></div>
+  <div id="qr-hidden" style="position:absolute;left:-10000px;top:0;width:600px;height:600px;overflow:hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

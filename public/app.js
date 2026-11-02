@@ -1,4 +1,3 @@
-<script>
 (function () {
 'use strict';
 
@@ -14,6 +13,12 @@ const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fold = s => String(s || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/\s+/g, ' ');
 const app = $('#app');
+function showFatal(msg) {
+  if (!app.querySelector('.loading-page')) return;
+  app.innerHTML = `<div class="card"><div class="alert err"><b>Không tải được ứng dụng.</b><br>${esc(msg)}</div><button class="btn" onclick="location.reload()">Tải lại trang</button></div>`;
+}
+window.addEventListener('error', e => showFatal(e.message || 'Lỗi không xác định'));
+window.addEventListener('unhandledrejection', e => showFatal((e.reason && e.reason.message) || String(e.reason)));
 const LOADING = '<div class="loading-page"><div class="spinner"></div><p>Đang tải…</p></div>';
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
@@ -23,21 +28,32 @@ const store = {
   del(k) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } try { sessionStorage.removeItem(k); } catch (e) { /* ignore */ } },
 };
 
-function call(action, payload) {
-  return new Promise((resolve, reject) => {
-    google.script.run
-      .withSuccessHandler(raw => {
-        let o;
-        try { o = JSON.parse(raw); } catch (e) { return reject(new Error('Phản hồi không hợp lệ từ máy chủ.')); }
-        if (o.ok) return resolve(o.data);
-        const err = new Error(o.error || 'Có lỗi xảy ra');
-        err.code = o.code;
-        if (o.code === 'AUTH') { S.token = null; store.del('hs_token'); setTimeout(renderLogin, 50); }
-        reject(err);
-      })
-      .withFailureHandler(e => reject(new Error((e && e.message) || 'Mất kết nối, vui lòng thử lại.')))
-      .api(action, S.token, payload || {});
-  });
+async function call(action, payload) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), /upload/i.test(action) ? 180000 : 60000);
+  let res;
+  try {
+    res = await fetch('api/' + action, {
+      method: 'POST', signal: ctl.signal,
+      headers: Object.assign({ 'Content-Type': 'application/json' }, S.token ? { Authorization: 'Bearer ' + S.token } : {}),
+      body: JSON.stringify(payload || {}),
+    });
+  } catch (e) {
+    throw new Error(e.name === 'AbortError' ? 'Máy chủ phản hồi quá lâu, vui lòng thử lại.' : 'Mất kết nối, vui lòng kiểm tra mạng và thử lại.');
+  } finally { clearTimeout(timer); }
+  let o;
+  try { o = await res.json(); } catch (e) { throw new Error('Máy chủ đang bận hoặc lỗi (' + res.status + '). Vui lòng thử lại.'); }
+  if (o.ok) return o.data;
+  const err = new Error(o.error || 'Có lỗi xảy ra');
+  err.code = o.code;
+  if (o.code === 'AUTH') { S.token = null; store.del('hs_token'); setTimeout(renderLogin, 50); }
+  throw err;
+}
+/** Link xem file qua máy chủ (có kiểm tra quyền) */
+function fileHref(fv) {
+  if (!fv) return '';
+  const m = String(fv.id || '').match(/^[\w-]{10,}$/) ? [0, fv.id] : String(fv.url || fv.v || '').match(/\/d\/([\w-]{10,})/) || String(fv.url || '').match(/[?&]id=([\w-]{10,})/);
+  return m ? 'api/file/' + encodeURIComponent(m[1]) + '?t=' + encodeURIComponent(S.token || '') : '';
 }
 
 let busyN = 0;
@@ -105,6 +121,7 @@ window.addEventListener('beforeunload', e => { if (S.dirtyForm && S.dirtyForm.di
 
 /* ================= Khởi động & đăng nhập ================= */
 async function boot() {
+  window.__appStarted = true;
   S.token = S.token || store.get('hs_token');
   if (!S.token) return renderLogin();
   app.innerHTML = LOADING;
@@ -112,6 +129,7 @@ async function boot() {
     const me = await call('me');
     S.me = me.user; S.fields = me.fields; S.sections = me.sections; S.nvFields = me.nvFields || []; S.config = me.config || {};
     S.fmap = {}; S.fields.forEach(f => { S.fmap[f.key] = f; });
+    if (S.config.appName) { document.title = S.config.appName; $('#appTitle').textContent = S.config.appName; }
     renderUserBox();
     if (S.me.role) renderHr('pending'); else renderEmployee(app);
   } catch (e) {
@@ -194,8 +212,9 @@ function formState(o) {
 function fileBoxHtml(f, st) {
   const fv = fileObj(st.data[f.key]);
   const prev = st.previews[f.key];
-  const thumb = prev ? `<img src="${prev}" alt="">` : (fv ? (f.type === 'image' ? '🖼️' : '📄') : '➕');
-  const nm = fv ? ((st.hr && fv.url) ? `<a href="${esc(fv.url)}" target="_blank" rel="noopener">${esc(fv.name || 'Xem tệp')}</a>` : esc(fv.name || 'Tệp đã tải')) : '<span class="muted">Chưa tải lên</span>';
+  const thumb = prev ? `<img src="${prev}" alt="">` : (fv ? ((f.type === 'image' && fileHref(fv)) ? `<img src="${esc(fileHref(fv))}" alt="" loading="lazy" onerror="this.replaceWith('🖼️')">` : (f.type === 'image' ? '🖼️' : '📄')) : '➕');
+  const href = fileHref(fv);
+  const nm = fv ? (href ? `<a href="${esc(href)}" target="_blank" rel="noopener">${esc(fv.name || 'Xem tệp')}</a>` : esc(fv.name || 'Tệp đã tải')) : '<span class="muted">Chưa tải lên</span>';
   const accept = f.type === 'image' ? 'image/*' : 'image/*,application/pdf,.pdf,.doc,.docx';
   let acts = '';
   if (st.editable) {
@@ -386,6 +405,23 @@ function parseCccd(text) {
 window.__parseCccd = parseCccd; // phục vụ kiểm thử
 
 let qrInst = null;
+let qrLibPromise = null;
+function loadQrLib() {
+  if (typeof Html5Qrcode !== 'undefined') return Promise.resolve();
+  if (qrLibPromise) return qrLibPromise;
+  const srcs = ['vendor/html5-qrcode.min.js', 'https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js'];
+  const tryLoad = i => new Promise((res, rej) => {
+    if (i >= srcs.length) return rej(new Error('Không tải được thư viện quét QR . Bạn vẫn có thể nhập tay thông tin CCCD.'));
+    const sc = document.createElement('script');
+    const t = setTimeout(() => { sc.remove(); tryLoad(i + 1).then(res, rej); }, 15000);
+    sc.src = srcs[i]; sc.async = true;
+    sc.onload = () => { clearTimeout(t); typeof Html5Qrcode !== 'undefined' ? res() : tryLoad(i + 1).then(res, rej); };
+    sc.onerror = () => { clearTimeout(t); sc.remove(); tryLoad(i + 1).then(res, rej); };
+    document.head.appendChild(sc);
+  });
+  qrLibPromise = tryLoad(0).catch(e => { qrLibPromise = null; throw e; });
+  return qrLibPromise;
+}
 function qrConfig() {
   return { formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE], experimentalFeatures: { useBarCodeDetectorIfSupported: true }, verbose: false };
 }
@@ -395,7 +431,7 @@ function stopQr() {
   try { q.stop().then(() => q.clear()).catch(() => {}); } catch (e) { /* ignore */ }
 }
 async function scanLive(st, root) {
-  if (typeof Html5Qrcode === 'undefined') return toast('Chưa tải được thư viện quét QR, vui lòng kiểm tra mạng.', 'err');
+  try { await run('Đang chuẩn bị máy quét…', loadQrLib); } catch (e) { return toast(e.message, 'err', 8000); }
   modal({
     title: 'Quét mã QR trên CCCD',
     body: '<div id="qr-reader"></div><p class="muted small" style="margin-top:10px">Đưa mã QR vào giữa khung, giữ máy cách thẻ 10–15 cm, đủ sáng và không bị lóa.</p>',
@@ -413,7 +449,7 @@ async function scanLive(st, root) {
   }
 }
 async function scanFromFile(file, st, root) {
-  if (typeof Html5Qrcode === 'undefined') return toast('Chưa tải được thư viện quét QR, vui lòng kiểm tra mạng.', 'err');
+  try { await run('Đang chuẩn bị máy quét…', loadQrLib); } catch (e) { return toast(e.message, 'err', 8000); }
   const q = new Html5Qrcode('qr-hidden', qrConfig());
   const attempt = async () => {
     try { return await q.scanFile(file, false); } catch (e) { /* thử tiếp */ }
@@ -761,4 +797,3 @@ function hrAdd(body) {
 
 boot();
 })();
-</script>

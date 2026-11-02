@@ -1,4 +1,44 @@
 /**
+ * Nghiệp vụ: đăng nhập, hồ sơ nhân viên, duyệt của nhân sự (chuyển từ bản Apps Script)
+ */
+const jwt = require('jsonwebtoken');
+const { CONFIG, ST, EDITABLE_ST, SECTIONS, FIELDS, NV_FIELDS } = require('./config');
+const { formatDate, norm, fold, isEmail, uuid, fmtDate, dtStr, dateStr, toDate, age, lastName, escHtml, cache } = require('./util');
+const { table_, rec_, find_, findAll_, writeRow_, appendRow_, upsertWa_, log_, queueMail } = require('./store');
+const { sendMail, mailTpl, sendOtpMail_, sendEmployeeMail_, sendInviteMail_ } = require('./mail');
+
+/** Xác định người dùng theo email: nhân sự (WA_PhanQuyen) và/hoặc nhân viên (ThongTinNhanVien) */
+function resolveUser_(email) {
+  email = norm(email);
+  const user = { email: email, role: null, scope: [], name: '', maNV: null, blocked: false };
+
+  const q = table_(CONFIG.SHEET_QUYEN);
+  const fq = find_(q, 'Email', email);
+  if (fq) {
+    const active = fq.rec.KichHoat === '' || fq.rec.KichHoat === true || norm(fq.rec.KichHoat) === 'true';
+    if (active && String(fq.rec.VaiTro || '').trim()) {
+      user.role = String(fq.rec.VaiTro).trim().toUpperCase() === 'ADMIN' ? 'ADMIN' : 'HR';
+      user.scope = String(fq.rec.PhamVi || '').split(/[,;\n]/).map(function (s) { return s.trim(); }).filter(String);
+      user.name = String(fq.rec.HoTen || '');
+    }
+  }
+
+  const nv = table_(CONFIG.SHEET_NV);
+  const all = findAll_(nv, 'EmailCaNhan', email);
+  const blocked = CONFIG.BLOCKED_WORK_STATUS.map(norm);
+  const activeRows = all.filter(function (r) { return blocked.indexOf(norm(r.rec.TrangThaiLamViec)) < 0; });
+  const pick = activeRows.length ? activeRows[activeRows.length - 1] : null;
+  if (pick) {
+    user.maNV = String(pick.rec.MaNhanVien).trim();
+    user.name = user.name || String(pick.rec.HoVaTen || '');
+  } else if (all.length) {
+    user.blocked = true;
+  }
+  return user;
+}
+
+
+/**
  * Nghiệp vụ hồ sơ: nhân viên khai – nộp – nhân sự duyệt – lưu vào ThongTinCaNhan.
  */
 
@@ -32,9 +72,9 @@ function fileVal_(v) {
 
 function cellToData_(f, v) {
   if (isFileField_(f)) return fileVal_(v);
-  if (f.type === 'date') return dateStr_(v);
+  if (f.type === 'date') return dateStr(v);
   if (v === null || v === undefined) return '';
-  if (v instanceof Date) return fmtDate_(v);
+  if (v instanceof Date) return fmtDate(v);
   return String(v);
 }
 
@@ -60,7 +100,7 @@ function mergeCn_(data, cn) {
 }
 
 function truthy_(v) {
-  return v === true || ['true', 'yes', 'y', '1', 'có', 'x'].indexOf(norm_(v)) >= 0;
+  return v === true || ['true', 'yes', 'y', '1', 'có', 'x'].indexOf(norm(v)) >= 0;
 }
 
 function recvFromCn_(cn) {
@@ -87,6 +127,12 @@ function state_(maNV) {
   return { status: status, data: data, hoso: hoso, cn: cn };
 }
 
+/** SĐT lưu dạng số trong sheet bị mất số 0 đầu -> thêm lại */
+function phone_(v) {
+  const s = String(v == null ? '' : v).replace(/[\s.]/g, '');
+  return /^[1-9]\d{8}$/.test(s) ? '0' + s : s;
+}
+
 function withDefaults_(data, nv) {
   const out = Object.assign({}, data);
   FIELDS.forEach(function (f) {
@@ -94,27 +140,23 @@ function withDefaults_(data, nv) {
     if (f.def !== undefined && out[f.key] === '') out[f.key] = f.def;
   });
   out.EmailCaNhan = String(nv.EmailCaNhan || '').trim();
-  if (!out.SoDienThoai && nv.SoDienThoai) out.SoDienThoai = String(nv.SoDienThoai).replace(/[\s.]/g, '');
+  if (!out.SoDienThoai && nv.SoDienThoai) out.SoDienThoai = phone_(nv.SoDienThoai);
   return out;
 }
 
-function dtStr_(v) {
-  if (!(v instanceof Date) || isNaN(v.getTime())) return v ? String(v) : '';
-  return Utilities.formatDate(v, CONFIG.TIMEZONE, 'dd/MM/yyyy HH:mm');
-}
 
 function nvPublic_(nv) {
   return {
     MaNhanVien: String(nv.MaNhanVien || ''),
     HoVaTen: String(nv.HoVaTen || ''),
     EmailCaNhan: String(nv.EmailCaNhan || ''),
-    SoDienThoai: String(nv.SoDienThoai || ''),
+    SoDienThoai: phone_(nv.SoDienThoai),
     TrangThaiLamViec: String(nv.TrangThaiLamViec || ''),
     DonVi: String(nv['DonVi/ChiNhanh'] || ''),
     ChucDanh: String(nv.ChucDanhHienTai || ''),
     LoaiNV: String(nv['HinhThuc/LoaiNhanVien'] || ''),
     TenTruong: String(nv.TenTruong || ''),
-    NgayVaoLam: dateStr_(nv.NgayVaoLamDauTien),
+    NgayVaoLam: dateStr(nv.NgayVaoLamDauTien),
   };
 }
 
@@ -131,7 +173,7 @@ function sanitize_(input, prev, maNV) {
       const nv = fileVal_(v);
       if (!nv) { out[f.key] = ''; return; }
       if (pv && nv.v === pv.v) { out[f.key] = pv; return; }
-      if (nv.id && cache_().get('UPL_' + nv.id) === String(maNV)) {
+      if (nv.id && cache.get('UPL_' + nv.id) === String(maNV)) {
         out[f.key] = { v: String(nv.v), url: String(nv.url || ''), name: String(nv.name || '').slice(0, 200), id: String(nv.id) };
         return;
       }
@@ -140,7 +182,7 @@ function sanitize_(input, prev, maNV) {
     }
     if (v === null || v === undefined) v = '';
     v = String(v).trim().slice(0, f.type === 'textarea' ? 3000 : 300);
-    if (f.type === 'date') v = dateStr_(v);
+    if (f.type === 'date') v = dateStr(v);
     if (f.type === 'digits' || f.type === 'tel') v = v.replace(/[\s.]/g, '');
     if (f.type === 'select' && f.options && v && f.options.indexOf(v) < 0 && prev[f.key] !== v) v = '';
     out[f.key] = v;
@@ -161,7 +203,7 @@ function validate_(data, requireAll) {
     if (isEmpty_(f, v)) { if (requireAll && f.required) errs.push(f.label + ': chưa nhập'); return; }
     if (f.pattern && !isFileField_(f) && !new RegExp(f.pattern).test(String(v))) errs.push(f.label + ': không đúng định dạng' + (f.hint ? ' (' + f.hint + ')' : ''));
     if (f.type === 'date') {
-      const d = toDate_(v);
+      const d = toDate(v);
       if (!d || d > new Date()) errs.push(f.label + ': ngày không hợp lệ');
     }
   });
@@ -174,7 +216,7 @@ function checkDuplicateCccd_(maNV, cccd) {
   const t = table_(CONFIG.SHEET_CN);
   if (t.idx.SoCCCD === undefined) return;
   findAll_(t, 'SoCCCD', cccd).forEach(function (r) {
-    if (norm_(r.rec.MaNhanVien) !== norm_(maNV)) {
+    if (norm(r.rec.MaNhanVien) !== norm(maNV)) {
       throw new Error('Số CCCD này đã có trong hồ sơ của nhân viên khác (' + r.rec.MaNhanVien + '). Vui lòng liên hệ Nhân sự.');
     }
   });
@@ -202,23 +244,23 @@ function pendingRequest_(maNV) {
 /** Ghi hồ sơ đã duyệt vào sheet ThongTinCaNhan */
 function writeCN_(nv, data, received, actor) {
   const maNV = String(nv.MaNhanVien);
-  const t = table_(CONFIG.SHEET_CN, true);
+  const t = table_(CONFIG.SHEET_CN);
   const f = find_(t, 'MaNhanVien', maNV);
   const vals = {};
   FIELDS.forEach(function (fd) {
     let v = data[fd.key];
     if (isFileField_(fd)) { const fv = fileVal_(v); v = fv ? fv.v : ''; }
-    else if (fd.type === 'date') v = toDate_(v) || '';
+    else if (fd.type === 'date') v = toDate(v) || '';
     else if (fd.type === 'number') v = (v === '' || isNaN(Number(v))) ? v : Number(v);
     vals[fd.key] = v;
   });
   vals.MaNhanVien = maNV;
   vals.HoVaTen = nv.HoVaTen;
-  vals.Ten = nv.Ten || lastName_(nv.HoVaTen);
+  vals.Ten = nv.Ten || lastName(nv.HoVaTen);
   vals.TrangThaiLV = nv.TrangThaiLamViec;
   vals.BU1 = nv.BU1;
   vals.BU2 = nv.BU2;
-  if (CONFIG.WRITE_TUOI && vals.NgaySinh instanceof Date) vals.Tuoi = age_(vals.NgaySinh);
+  if (CONFIG.WRITE_TUOI && vals.NgaySinh instanceof Date) vals.Tuoi = age(vals.NgaySinh);
   if (received) FIELDS.forEach(function (fd) {
     if (fd.recv && Object.prototype.hasOwnProperty.call(received, fd.recv)) vals[fd.recv] = !!received[fd.recv];
   });
@@ -232,12 +274,11 @@ function writeCN_(nv, data, received, actor) {
     vals.NguoiTao = actor;
     appendRow_(t, 'MaNhanVien', vals);
   }
-  invalidate_(CONFIG.SHEET_CN);
 
   if (CONFIG.SYNC_PHONE_TO_NV && data.SoDienThoai) {
     const tn = table_(CONFIG.SHEET_NV);
     const fn = find_(tn, 'MaNhanVien', maNV);
-    if (fn && String(fn.rec.SoDienThoai || '').replace(/[\s.]/g, '') !== data.SoDienThoai) {
+    if (fn && phone_(fn.rec.SoDienThoai) !== data.SoDienThoai) {
       writeRow_(tn, fn.rowNum, { SoDienThoai: data.SoDienThoai, NgayCapNhat: new Date(), NguoiCapNhat: actor });
     }
   }
@@ -255,10 +296,10 @@ function api_getMyProfile(p, ctx) {
     data: withDefaults_(s.data, nv),
     ghiChuNS: s.hoso ? String(s.hoso.rec.GhiChuNS || '') : '',
     ghiChuNV: s.hoso ? String(s.hoso.rec.GhiChuNV || '') : '',
-    ngayNop: s.hoso ? dtStr_(s.hoso.rec.NgayNop) : '',
-    ngayDuyet: s.hoso ? dtStr_(s.hoso.rec.NgayDuyet) : '',
-    editRequest: yc ? { lyDo: String(yc.LyDo || ''), ngayTao: dtStr_(yc.NgayTao) } : null,
-    lastRequest: lastYc && lastYc.rec.TrangThai === 'TU_CHOI' ? { phanHoi: String(lastYc.rec.PhanHoi || ''), ngayXuLy: dtStr_(lastYc.rec.NgayXuLy) } : null,
+    ngayNop: s.hoso ? dtStr(s.hoso.rec.NgayNop) : '',
+    ngayDuyet: s.hoso ? dtStr(s.hoso.rec.NgayDuyet) : '',
+    editRequest: yc ? { lyDo: String(yc.LyDo || ''), ngayTao: dtStr(yc.NgayTao) } : null,
+    lastRequest: lastYc && lastYc.rec.TrangThai === 'TU_CHOI' ? { phanHoi: String(lastYc.rec.PhanHoi || ''), ngayXuLy: dtStr(lastYc.rec.NgayXuLy) } : null,
   };
 }
 
@@ -276,7 +317,7 @@ function api_saveDraft(p, ctx) {
   const clean = withDefaults_(sanitize_(p.data, s.data, ctx.maNV), nv);
   const status = s.status === ST.CHUA ? ST.NHAP : s.status;
   saveHoSo_(nv, { TrangThai: status, DuLieu: clean, GhiChuNV: String(p.note || '').slice(0, 1000) });
-  return { status: status, data: clean, savedAt: dtStr_(new Date()) };
+  return { status: status, data: clean, savedAt: dtStr(new Date()) };
 }
 
 function api_submit(p, ctx) {
@@ -291,7 +332,7 @@ function api_submit(p, ctx) {
   checkDuplicateCccd_(ctx.maNV, clean.SoCCCD);
   saveHoSo_(nv, { TrangThai: ST.CHO_DUYET, DuLieu: clean, GhiChuNV: String(p.note || '').slice(0, 1000), NgayNop: new Date() });
   log_(ctx.maNV, 'NOP_HO_SO', ctx.email, s.status === ST.MO_SUA ? 'Nộp lại sau chỉnh sửa' : '');
-  if (CONFIG.NOTIFY_HR_ON_SUBMIT) notifyHr_(nv, 'Hồ sơ mới chờ duyệt', nv.HoVaTen + ' (' + nv.MaNhanVien + ') vừa nộp hồ sơ.' + (p.note ? '<br>Ghi chú: ' + escHtml_(p.note) : ''));
+  if (CONFIG.NOTIFY_HR_ON_SUBMIT) notifyHr_(nv, 'Hồ sơ mới chờ duyệt', nv.HoVaTen + ' (' + nv.MaNhanVien + ') vừa nộp hồ sơ.' + (p.note ? '<br>Ghi chú: ' + escHtml(p.note) : ''));
   return { status: ST.CHO_DUYET };
 }
 
@@ -311,25 +352,22 @@ function api_requestEdit(p, ctx) {
   if (s.status !== ST.DA_DUYET) throw new Error('Chỉ gửi yêu cầu chỉnh sửa khi hồ sơ đã được duyệt.');
   if (!reason) throw new Error('Vui lòng nhập nội dung cần chỉnh sửa.');
   if (pendingRequest_(ctx.maNV)) throw new Error('Bạn đã có một yêu cầu đang chờ Nhân sự xử lý.');
-  const id = 'YC' + Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyMMddHHmmss') + Math.floor(Math.random() * 90 + 10);
+  const id = 'YC' + formatDate(new Date(), 'yyMMddHHmmss') + Math.floor(Math.random() * 90 + 10);
   upsertWa_(CONFIG.SHEET_YC, 'MaYeuCau', id, {
     MaYeuCau: id, MaNhanVien: ctx.maNV, HoVaTen: nv.HoVaTen, EmailCaNhan: nv.EmailCaNhan,
     LyDo: reason.slice(0, 2000), TrangThai: 'CHO_XU_LY', NgayTao: new Date(),
   });
   log_(ctx.maNV, 'YEU_CAU_SUA', ctx.email, reason);
-  notifyHr_(nv, 'Yêu cầu chỉnh sửa hồ sơ', nv.HoVaTen + ' (' + nv.MaNhanVien + ') yêu cầu chỉnh sửa hồ sơ:<br><i>' + escHtml_(reason) + '</i>');
+  notifyHr_(nv, 'Yêu cầu chỉnh sửa hồ sơ', nv.HoVaTen + ' (' + nv.MaNhanVien + ') yêu cầu chỉnh sửa hồ sơ:<br><i>' + escHtml(reason) + '</i>');
   return { ok: true };
 }
 
 /* ===================== API nhân sự ===================== */
-function fold_(s) {
-  return norm_(s).normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/đ/g, 'd');
-}
 
 function hrCanSee_(ctx, nvRec) {
   if (!ctx.scope || !ctx.scope.length) return true;
-  const v = norm_(nvRec[CONFIG.SCOPE_COLUMN]);
-  return ctx.scope.some(function (s) { return norm_(s) === v; });
+  const v = norm(nvRec[CONFIG.SCOPE_COLUMN]);
+  return ctx.scope.some(function (s) { return norm(s) === v; });
 }
 
 function requireHrAccess_(ctx, maNV) {
@@ -356,16 +394,16 @@ function api_hrMeta(p, ctx) {
   const h = table_(CONFIG.SHEET_HOSO);
   const y = table_(CONFIG.SHEET_YC);
   const nvIdx = {};
-  t.rows.forEach(function (r) { nvIdx[norm_(r[t.idx.MaNhanVien])] = rec_(t, r); });
+  t.rows.forEach(function (r) { nvIdx[norm(r[t.idx.MaNhanVien])] = rec_(t, r); });
   let pending = 0, requests = 0;
   h.rows.forEach(function (r) {
     const o = rec_(h, r);
-    const nv = nvIdx[norm_(o.MaNhanVien)];
+    const nv = nvIdx[norm(o.MaNhanVien)];
     if (o.TrangThai === ST.CHO_DUYET && nv && hrCanSee_(ctx, nv)) pending++;
   });
   y.rows.forEach(function (r) {
     const o = rec_(y, r);
-    const nv = nvIdx[norm_(o.MaNhanVien)];
+    const nv = nvIdx[norm(o.MaNhanVien)];
     if (o.TrangThai === 'CHO_XU_LY' && nv && hrCanSee_(ctx, nv)) requests++;
   });
   return { lists: lists, counts: { pending: pending, requests: requests } };
@@ -374,18 +412,18 @@ function api_hrMeta(p, ctx) {
 function api_hrList(p, ctx) {
   const nvT = table_(CONFIG.SHEET_NV), hT = table_(CONFIG.SHEET_HOSO), cT = table_(CONFIG.SHEET_CN), yT = table_(CONFIG.SHEET_YC);
   const hMap = {};
-  hT.rows.forEach(function (r) { const o = rec_(hT, r); hMap[norm_(o.MaNhanVien)] = o; });
+  hT.rows.forEach(function (r) { const o = rec_(hT, r); hMap[norm(o.MaNhanVien)] = o; });
   const cSet = {};
-  if (cT.idx.MaNhanVien !== undefined) cT.rows.forEach(function (r) { cSet[norm_(r[cT.idx.MaNhanVien])] = true; });
+  if (cT.idx.MaNhanVien !== undefined) cT.rows.forEach(function (r) { cSet[norm(r[cT.idx.MaNhanVien])] = true; });
   const ySet = {};
-  yT.rows.forEach(function (r) { const o = rec_(yT, r); if (o.TrangThai === 'CHO_XU_LY') ySet[norm_(o.MaNhanVien)] = true; });
-  const q = fold_(p.q || '');
+  yT.rows.forEach(function (r) { const o = rec_(yT, r); if (o.TrangThai === 'CHO_XU_LY') ySet[norm(o.MaNhanVien)] = true; });
+  const q = fold(p.q || '');
   const seen = {};
   const out = [];
   for (let i = nvT.rows.length - 1; i >= 0; i--) {
     const o = rec_(nvT, nvT.rows[i]);
     const ma = String(o.MaNhanVien || '').trim();
-    const k = norm_(ma);
+    const k = norm(ma);
     if (!ma || seen[k]) continue;
     seen[k] = 1;
     if (!hrCanSee_(ctx, o)) continue;
@@ -394,13 +432,13 @@ function api_hrList(p, ctx) {
     if (p.status && p.status !== 'ALL' && st !== p.status) continue;
     if (p.onlyRequests && !ySet[k]) continue;
     if (q) {
-      const hay = fold_([ma, o.HoVaTen, o.EmailCaNhan, o.SoDienThoai, o['DonVi/ChiNhanh'], o.TenTruong].join(' '));
+      const hay = fold([ma, o.HoVaTen, o.EmailCaNhan, o.SoDienThoai, o['DonVi/ChiNhanh'], o.TenTruong].join(' '));
       if (hay.indexOf(q) < 0) continue;
     }
     out.push({
-      maNV: ma, hoTen: String(o.HoVaTen || ''), email: String(o.EmailCaNhan || ''), sdt: String(o.SoDienThoai || ''),
+      maNV: ma, hoTen: String(o.HoVaTen || ''), email: String(o.EmailCaNhan || ''), sdt: phone_(o.SoDienThoai),
       donVi: String(o['DonVi/ChiNhanh'] || ''), truong: String(o.TenTruong || ''), trangThaiLV: String(o.TrangThaiLamViec || ''),
-      status: st, ngayNop: h ? dtStr_(h.NgayNop) : '', ts: h && h.NgayNop instanceof Date ? h.NgayNop.getTime() : 0,
+      status: st, ngayNop: h ? dtStr(h.NgayNop) : '', ts: h && h.NgayNop instanceof Date ? h.NgayNop.getTime() : 0,
       hasRequest: !!ySet[k],
     });
   }
@@ -420,10 +458,10 @@ function api_hrGetProfile(p, ctx) {
   const s = state_(p.maNV);
   const logT = table_(CONFIG.SHEET_LOG);
   const logs = findAll_(logT, 'MaNhanVien', p.maNV).slice(-30).reverse().map(function (r) {
-    return { t: dtStr_(r.rec.ThoiGian), a: String(r.rec.HanhDong || ''), u: String(r.rec.NguoiThucHien || ''), d: String(r.rec.ChiTiet || '') };
+    return { t: dtStr(r.rec.ThoiGian), a: String(r.rec.HanhDong || ''), u: String(r.rec.NguoiThucHien || ''), d: String(r.rec.ChiTiet || '') };
   });
   const reqs = findAll_(table_(CONFIG.SHEET_YC), 'MaNhanVien', p.maNV).reverse().map(function (r) {
-    return { id: r.rec.MaYeuCau, lyDo: String(r.rec.LyDo || ''), trangThai: r.rec.TrangThai, phanHoi: String(r.rec.PhanHoi || ''), ngayTao: dtStr_(r.rec.NgayTao), nguoiXuLy: String(r.rec.NguoiXuLy || '') };
+    return { id: r.rec.MaYeuCau, lyDo: String(r.rec.LyDo || ''), trangThai: r.rec.TrangThai, phanHoi: String(r.rec.PhanHoi || ''), ngayTao: dtStr(r.rec.NgayTao), nguoiXuLy: String(r.rec.NguoiXuLy || '') };
   });
   return {
     nv: nvPublic_(nv),
@@ -433,9 +471,9 @@ function api_hrGetProfile(p, ctx) {
     received: recvFromCn_(s.cn),
     ghiChuNS: s.hoso ? String(s.hoso.rec.GhiChuNS || '') : '',
     ghiChuNV: s.hoso ? String(s.hoso.rec.GhiChuNV || '') : '',
-    ngayNop: s.hoso ? dtStr_(s.hoso.rec.NgayNop) : '',
+    ngayNop: s.hoso ? dtStr(s.hoso.rec.NgayNop) : '',
     nguoiDuyet: s.hoso ? String(s.hoso.rec.NguoiDuyet || '') : '',
-    ngayDuyet: s.hoso ? dtStr_(s.hoso.rec.NgayDuyet) : '',
+    ngayDuyet: s.hoso ? dtStr(s.hoso.rec.NgayDuyet) : '',
     requests: reqs,
     logs: logs,
   };
@@ -457,7 +495,7 @@ function api_hrSave(p, ctx) {
   });
   log_(p.maNV, wasPending ? 'DUYET' : 'NS_CAP_NHAT', ctx.email, p.note || '');
   if (wasPending) sendEmployeeMail_(nv, 'Hồ sơ của bạn đã được duyệt',
-    'Phòng Nhân sự đã duyệt và lưu hồ sơ của bạn.' + (p.note ? '<br>Ghi chú: ' + escHtml_(p.note) : ''));
+    'Phòng Nhân sự đã duyệt và lưu hồ sơ của bạn.' + (p.note ? '<br>Ghi chú: ' + escHtml(p.note) : ''));
   return { status: ST.DA_DUYET };
 }
 
@@ -469,7 +507,7 @@ function api_hrReject(p, ctx) {
   if (!note) throw new Error('Vui lòng ghi rõ nội dung nhân viên cần bổ sung/chỉnh sửa.');
   saveHoSo_(nv, { TrangThai: ST.TU_CHOI, GhiChuNS: note.slice(0, 1000), NguoiDuyet: ctx.email, NgayDuyet: new Date() });
   log_(p.maNV, 'TRA_LAI', ctx.email, note);
-  sendEmployeeMail_(nv, 'Hồ sơ cần bổ sung', 'Phòng Nhân sự đề nghị bạn bổ sung/chỉnh sửa hồ sơ:<br><b>' + escHtml_(note) + '</b>');
+  sendEmployeeMail_(nv, 'Hồ sơ cần bổ sung', 'Phòng Nhân sự đề nghị bạn bổ sung/chỉnh sửa hồ sơ:<br><b>' + escHtml(note) + '</b>');
   return { status: ST.TU_CHOI };
 }
 
@@ -481,7 +519,7 @@ function api_hrUnlock(p, ctx) {
   const note = String(p.note || '').trim() || 'Nhân sự đã mở hồ sơ để bạn cập nhật.';
   saveHoSo_(nv, { TrangThai: ST.MO_SUA, DuLieu: withDefaults_(s.data, nv), GhiChuNS: note.slice(0, 1000) });
   log_(p.maNV, 'MO_CHINH_SUA', ctx.email, note);
-  sendEmployeeMail_(nv, 'Hồ sơ đã được mở để cập nhật', escHtml_(note));
+  sendEmployeeMail_(nv, 'Hồ sơ đã được mở để cập nhật', escHtml(note));
   return { status: ST.MO_SUA };
 }
 
@@ -489,18 +527,18 @@ function api_hrEditRequests(p, ctx) {
   const yT = table_(CONFIG.SHEET_YC);
   const nvT = table_(CONFIG.SHEET_NV);
   const nvIdx = {};
-  nvT.rows.forEach(function (r) { nvIdx[norm_(r[nvT.idx.MaNhanVien])] = rec_(nvT, r); });
+  nvT.rows.forEach(function (r) { nvIdx[norm(r[nvT.idx.MaNhanVien])] = rec_(nvT, r); });
   const want = p.status || 'CHO_XU_LY';
   const out = [];
   yT.rows.forEach(function (r) {
     const o = rec_(yT, r);
     if (want !== 'ALL' && o.TrangThai !== want) return;
-    const nv = nvIdx[norm_(o.MaNhanVien)];
+    const nv = nvIdx[norm(o.MaNhanVien)];
     if (!nv || !hrCanSee_(ctx, nv)) return;
     out.push({
       id: String(o.MaYeuCau), maNV: String(o.MaNhanVien), hoTen: String(o.HoVaTen || nv.HoVaTen || ''),
       donVi: String(nv['DonVi/ChiNhanh'] || ''), lyDo: String(o.LyDo || ''), trangThai: o.TrangThai,
-      phanHoi: String(o.PhanHoi || ''), ngayTao: dtStr_(o.NgayTao), nguoiXuLy: String(o.NguoiXuLy || ''),
+      phanHoi: String(o.PhanHoi || ''), ngayTao: dtStr(o.NgayTao), nguoiXuLy: String(o.NguoiXuLy || ''),
       ts: o.NgayTao instanceof Date ? o.NgayTao.getTime() : 0,
     });
   });
@@ -521,9 +559,9 @@ function api_hrResolveRequest(p, ctx) {
     const s = state_(f.rec.MaNhanVien);
     saveHoSo_(nv, { TrangThai: ST.MO_SUA, DuLieu: withDefaults_(s.data, nv), GhiChuNS: note || ('Đã mở chỉnh sửa theo yêu cầu: ' + f.rec.LyDo) });
     sendEmployeeMail_(nv, 'Yêu cầu chỉnh sửa đã được chấp nhận',
-      'Bạn có thể vào ứng dụng để chỉnh sửa hồ sơ, sau đó bấm <b>Nộp hồ sơ</b> để Nhân sự duyệt lại.' + (note ? '<br>Ghi chú: ' + escHtml_(note) : ''));
+      'Bạn có thể vào ứng dụng để chỉnh sửa hồ sơ, sau đó bấm <b>Nộp hồ sơ</b> để Nhân sự duyệt lại.' + (note ? '<br>Ghi chú: ' + escHtml(note) : ''));
   } else {
-    sendEmployeeMail_(nv, 'Yêu cầu chỉnh sửa chưa được chấp nhận', 'Phản hồi từ Nhân sự: ' + escHtml_(note));
+    sendEmployeeMail_(nv, 'Yêu cầu chỉnh sửa chưa được chấp nhận', 'Phản hồi từ Nhân sự: ' + escHtml(note));
   }
   log_(f.rec.MaNhanVien, p.accept ? 'CHAP_NHAN_YC' : 'TU_CHOI_YC', ctx.email, note);
   return { ok: true };
@@ -535,21 +573,21 @@ function api_hrAddEmployee(p, ctx) {
   NV_FIELDS.forEach(function (f) {
     let v = String(d[f.key] == null ? '' : d[f.key]).trim().slice(0, 500);
     if (f.required && !v) throw new Error(f.label + ' là bắt buộc.');
-    if (f.type === 'date') v = v ? toDate_(v) : '';
+    if (f.type === 'date') v = v ? toDate(v) : '';
     if (f.type === 'tel') v = v.replace(/[\s.]/g, '');
     vals[f.key] = v;
   });
-  vals.EmailCaNhan = norm_(vals.EmailCaNhan);
-  if (!isEmail_(vals.EmailCaNhan)) throw new Error('Email cá nhân không hợp lệ.');
+  vals.EmailCaNhan = norm(vals.EmailCaNhan);
+  if (!isEmail(vals.EmailCaNhan)) throw new Error('Email cá nhân không hợp lệ.');
   if (ctx.scope && ctx.scope.length && !hrCanSee_(ctx, vals)) throw new Error('Đơn vị/Chi nhánh không thuộc phạm vi bạn quản lý.');
 
   const t = table_(CONFIG.SHEET_NV);
   if (find_(t, 'MaNhanVien', vals.MaNhanVien)) throw new Error('Mã nhân viên ' + vals.MaNhanVien + ' đã tồn tại.');
-  const blocked = CONFIG.BLOCKED_WORK_STATUS.map(norm_);
-  const dup = findAll_(t, 'EmailCaNhan', vals.EmailCaNhan).filter(function (r) { return blocked.indexOf(norm_(r.rec.TrangThaiLamViec)) < 0; });
+  const blocked = CONFIG.BLOCKED_WORK_STATUS.map(norm);
+  const dup = findAll_(t, 'EmailCaNhan', vals.EmailCaNhan).filter(function (r) { return blocked.indexOf(norm(r.rec.TrangThaiLamViec)) < 0; });
   if (dup.length) throw new Error('Email này đang được dùng cho nhân viên ' + dup[0].rec.MaNhanVien + ' – ' + dup[0].rec.HoVaTen + '.');
 
-  vals.Ten = lastName_(vals.HoVaTen);
+  vals.Ten = lastName(vals.HoVaTen);
   vals.NgayTao = new Date();
   vals.NguoiTao = ctx.email;
   vals.NgayCapNhat = new Date();
@@ -563,8 +601,108 @@ function api_hrAddEmployee(p, ctx) {
 
 function api_hrSendInvite(p, ctx) {
   const nv = requireHrAccess_(ctx, p.maNV);
-  if (!isEmail_(nv.EmailCaNhan)) throw new Error('Nhân viên chưa có email cá nhân hợp lệ.');
+  if (!isEmail(nv.EmailCaNhan)) throw new Error('Nhân viên chưa có email cá nhân hợp lệ.');
   sendInviteMail_(nv);
   log_(p.maNV, 'GUI_LOI_MOI', ctx.email, nv.EmailCaNhan);
   return { ok: true };
 }
+
+function notifyHr_(nv, subject, html) {
+  try {
+    const t = table_(CONFIG.SHEET_QUYEN);
+    const to = [];
+    t.rows.forEach(function (r) {
+      const o = rec_(t, r);
+      const active = o.KichHoat === '' || truthy_(o.KichHoat);
+      if (!active || !truthy_(o.NhanThongBao) || !isEmail(o.Email)) return;
+      const scope = String(o.PhamVi || '').split(/[,;\n]/).map(function (s) { return s.trim(); }).filter(String);
+      if (!hrCanSee_({ scope: scope }, nv)) return;
+      to.push(String(o.Email).trim());
+    });
+    if (to.length) queueMail(() => sendMail(to.join(','), subject, mailTpl(subject, '<p>' + html + '</p>', true)));
+  } catch (e) { console.error('notifyHr_', e); }
+}
+
+
+/* ===================== Đăng nhập (OTP qua email, phiên bằng JWT) ===================== */
+function authError_(msg) {
+  const e = new Error(msg || 'Phiên đăng nhập đã hết hạn, vui lòng đăng nhập lại.');
+  e.code = 'AUTH';
+  return e;
+}
+
+function api_requestOtp(p) {
+  const email = norm(p.email);
+  if (!isEmail(email)) throw new Error('Email không hợp lệ.');
+  if (cache.get('OTPW_' + email)) throw new Error('Vui lòng chờ ' + CONFIG.OTP_RESEND_SECONDS + ' giây trước khi gửi lại mã.');
+  const dayKey = 'OTPD_' + email;
+  const sentToday = Number(cache.get(dayKey) || 0);
+  if (sentToday >= 10) throw new Error('Bạn đã yêu cầu mã quá nhiều lần. Vui lòng thử lại sau.');
+  const user = resolveUser_(email);
+  if (!user.role && !user.maNV) {
+    if (user.blocked) throw new Error('Tài khoản của bạn đã ngừng hoạt động. Vui lòng liên hệ phòng Nhân sự.');
+    throw new Error('Email này chưa được Nhân sự đăng ký trong hệ thống. Vui lòng liên hệ phòng Nhân sự.');
+  }
+  const code = String(require('crypto').randomInt(100000, 1000000));
+  cache.put('OTP_' + email, JSON.stringify({ code, tries: 0 }), CONFIG.OTP_TTL_MIN * 60);
+  cache.put('OTPW_' + email, '1', CONFIG.OTP_RESEND_SECONDS);
+  cache.put(dayKey, String(sentToday + 1), 6 * 3600);
+  sendOtpMail_(email, user.name, code);
+  return { sent: true, ttlMin: CONFIG.OTP_TTL_MIN };
+}
+
+function api_verifyOtp(p) {
+  const email = norm(p.email);
+  const code = String(p.code || '').replace(/\D/g, '');
+  const raw = cache.get('OTP_' + email);
+  if (!raw) throw new Error('Mã đã hết hạn. Vui lòng gửi lại mã mới.');
+  const o = JSON.parse(raw);
+  if (o.code !== code) {
+    o.tries++;
+    if (o.tries >= CONFIG.OTP_MAX_TRIES) { cache.remove('OTP_' + email); throw new Error('Nhập sai quá số lần cho phép. Vui lòng gửi lại mã mới.'); }
+    cache.put('OTP_' + email, JSON.stringify(o), CONFIG.OTP_TTL_MIN * 60);
+    throw new Error('Mã không đúng. Còn ' + (CONFIG.OTP_MAX_TRIES - o.tries) + ' lần thử.');
+  }
+  cache.remove('OTP_' + email);
+  const user = resolveUser_(email);
+  if (!user.role && !user.maNV) throw new Error('Tài khoản không còn hiệu lực.');
+  const token = jwt.sign({ e: email, j: uuid() }, CONFIG.SESSION_SECRET, { expiresIn: CONFIG.SESSION_HOURS * 3600 });
+  log_(user.maNV, 'DANG_NHAP', email, user.role || 'NV');
+  return { token };
+}
+
+/** Kiểm tra token. Quyền được đọc lại từ sheet ở mỗi request nên thu hồi quyền có hiệu lực ngay. */
+function requireSession_(token, need) {
+  let payload;
+  try { payload = jwt.verify(String(token || ''), CONFIG.SESSION_SECRET); } catch (e) { throw authError_(); }
+  if (cache.get('REVOKED_' + payload.j)) throw authError_();
+  const s = resolveUser_(payload.e);
+  if (!s.role && !s.maNV) throw authError_('Tài khoản không còn hiệu lực.');
+  s.jti = payload.j;
+  if (need === 'HR' && !s.role) throw new Error('Bạn không có quyền nhân sự.');
+  if (need === 'NV' && !s.maNV) throw new Error('Tài khoản của bạn không gắn với hồ sơ nhân viên nào.');
+  return s;
+}
+
+function api_logout(p, ctx) {
+  cache.put('REVOKED_' + ctx.jti, '1', CONFIG.SESSION_HOURS * 3600);
+  return true;
+}
+
+function api_me(p, ctx) {
+  return {
+    user: { email: ctx.email, name: ctx.name, role: ctx.role, maNV: ctx.maNV, scope: ctx.scope },
+    sections: SECTIONS,
+    fields: FIELDS,
+    nvFields: ctx.role ? NV_FIELDS : [],
+    config: { appName: CONFIG.APP_NAME, orgName: CONFIG.ORG_NAME, maxFileMb: CONFIG.MAX_FILE_MB },
+  };
+}
+
+module.exports = {
+  isFileField_, getNV_, editableState_, requireHrAccess_, requireSession_, fileVal_,
+  api_requestOtp, api_verifyOtp, api_logout, api_me,
+  api_getMyProfile, api_saveDraft, api_submit, api_withdraw, api_requestEdit,
+  api_hrMeta, api_hrList, api_hrGetProfile, api_hrSave, api_hrReject, api_hrUnlock,
+  api_hrEditRequests, api_hrResolveRequest, api_hrAddEmployee, api_hrSendInvite,
+};
